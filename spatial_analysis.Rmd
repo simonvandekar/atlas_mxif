@@ -1,0 +1,200 @@
+---
+title: "spatial_analysis"
+author: "Simon Vandekar"
+date: "10/26/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::knit_hooks$set(GPs=function(before, options, envir){
+  if (before){
+    cex=1.5
+    par(mgp=c(1.7,.7,0), lwd=1.5, lend=2,
+        cex.lab=0.8*cex, cex.axis=0.8*cex, cex.main=1*cex,
+        mar=c(2.8,2.8,1.8,.2), bty='l', oma=c(0,0,2,0))}
+})
+knitr::opts_chunk$set(echo = TRUE, fig.height = 4, fig.width = 4, GPs=TRUE, cache=TRUE)
+cols = c('#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00', '#cab2d6', '#6a3d9a', '#ffff99', '#b15928')
+colscale = c('#f0f9e8', '#ccebc5', '#a8ddb5','#7bccc4','#4eb3d3', '#2b8cbe', '#08589e')
+set.seed(1333)
+
+library(mclust)
+library(Rtsne)
+```
+
+## Data processing
+
+```{r, loadData}
+datafile = 'batch 1 quant in progress.rds'
+atl = readRDS(datafile)
+cellvars = grep('Median_Cell', names(atl), value=TRUE)
+# log transform
+atl[,cellvars] = log10(atl[,cellvars]+1)
+# screen out duplicates due to FOV overlap
+atl = atl[ which(!duplicated(atl[,cellvars])),]
+slideIDs = unique(atl$SlideID)
+```
+
+
+```{r, functions, eval=FALSE}
+
+EBupdate = function(l1s, G=3){
+  
+  # get level 1 parameters
+  #Gzs = sapply(l1s, function(x) x$G)
+  #nzs = lapply(l1s, function(x) colSums(x$z))
+  # for indexing the elements from the l2 clustering
+  Gzs = c(0,sapply(l1s, function(x) x$G))
+  nl1s = length(l1s)
+  
+    
+  params = do.call(rbind, lapply(l1s, function(x) t(x$parameters$mean)))
+  # fit second level model
+  l2 = Mclust(params, G=G)
+  # probabilities from l2 model
+  pzs=lapply(1:nl1s, function(l1ind) l2$z[(sum(Gzs[1:l1ind])+1):sum(Gzs[1:(l1ind+1)]),] )
+  
+  # higher cluster labels
+  labels = lapply(pzs, function(x) apply(x, 1, which.max) )
+
+  #Gz = l2$G
+  
+  # for testing
+  # l1 = l1s[[1]]; Gz = Gzs[[1]]; pz=pzs[[1]]
+  l1s = mapply(function(l1, pz, label){
+    l1$parameters$mean = EBmean(mu=l1$parameters$mean,
+                                sigma = l1$parameters$variance$sigma,
+                                mu0 = l2$parameters$mean,
+                                sigma0=l2$parameters$variance$sigma,
+                                pz=pz, ns = colSums(l1$z))
+    l1$l2labels = label
+    l1$l2pz = pz
+    ans = list(l1) }, l1=l1s, pz=pzs, label=labels)
+  ans = list(l1s=l1s, l2=l2)
+}
+
+# sigma should be an array
+# sigma is array of variances for l1
+# sigma0 is array of variances for l2
+# pz is probability of
+EBmean = function(mu, sigma, mu0, sigma0, pz, ns){
+  ans = do.call(cbind, lapply(1:dim(sigma)[3], function(ind){
+    sig = sigma[,,ind]/ns[ind]
+    mu0s = sapply(1:dim(sigma0)[3], function(ind0){
+      invmat = solve(sig + sigma0[,,ind0])
+      sig %*% invmat %*% mu0[,ind0] + sigma0[,,ind0] %*% invmat %*% mu[,ind]
+    })
+    ans = mu0s %*% pz[ind,]
+  }))
+}
+
+```
+
+
+## Data descriptives
+
+### Histograms
+```{r, histograms, fig.width=12, fig.height=6}
+transpcols = col2rgb(cols)
+transpcols = rgb(transpcols[1,], transpcols[2,], transpcols[3,], maxColorValue = 255, alpha = 127)
+#layout(matrix(1:30, nrow=6, byrow=TRUE))
+layout(matrix(1:8, nrow=2, byrow=TRUE))
+trash = sapply(cellvars,
+               function(cellvar){
+                 histinfo = hist(atl[,cellvar], plot=FALSE)
+                 hist(atl[atl$SlideID==slideIDs[1],cellvar], breaks=histinfo$breaks, col=transpcols[1], border=NA, main=slideIDs[1], xlab=cellvar, probability = TRUE)
+                 trash = sapply(2:length(slideIDs), function(ind){
+                   hist(atl[ atl$SlideID==slideIDs[ind],cellvar], breaks = histinfo$breaks, border=NA, probability=TRUE, col=transpcols[ind], main=slideIDs[ind], xlab=cellvar)
+                 } )
+                 mtext(cellvar, outer = TRUE, cex=1.5, )
+                 #dev.off()
+               })
+```
+
+
+### PCA
+```{r, PCA}
+# PCA components
+scelldata = scale(atl[,cellvars])
+varcomps = svd(scelldata, nu=0, nv=0)$d
+varcomps = varcomps^2/sum(varcomps^2)
+plot(1:length(varcomps), cumsum(varcomps), xlab='Component number', ylab='Proportion of variance', type='l')
+```
+
+### Hierarchical clustering of the markers
+```{r hclust, fig.width=6, fig.height=6}
+celldist <- dist(t(scelldata), method = "euclidean")
+# Hierarchical clustering using Complete Linkage
+hclustcell <- hclust(celldist, method = "complete" )
+# Plot the obtained dendrogram
+plot(hclustcell, hang = -1)
+# get three clusters marker membership
+members = cutree(hclustcell, k=3)
+```
+
+
+
+## Clustering
+
+### Run Rtsne
+
+```{r tsne, eval=FALSE}
+library(Rtsne)
+
+slideID = slideIDs[1]
+slidedata = atl[atl$SlideID == slideID , cellvars]
+tsne = Rtsne(slidedata)
+#s1clust = Mclust(slidedata, G=seq(5, 60, by=5), modelNames = model, prior=prior)
+#plot(tsne$Y[,1], tsne$Y[,2], pch=20, col=rep(cols, 5)[s1clust$classification])
+```
+
+
+### BIC for models
+```{r BIC}
+model='VVI' # diagonal, varying volume and shape
+prior=priorControl()
+Gs = seq(5, 30, by=5)
+BICs = lapply(slideIDs, function(slideID) mclustBIC(atl[atl$SlideID == slideID , cellvars], G=Gs, modelNames = model, prior = prior) )
+BICs = lapply(BICs, function(bic){ ans = (bic-min(bic)); ans=ans/max(ans) })
+plot(Gs, c(BICs[[1]]), col=cols[1], type='b', main='BIC', xlab='nclust', ylab='scaled BIC')
+trash = lapply(2:length(BICs), function(ind) points(Gs, BICs[[ind]], col=cols[ind], type='b'))
+```
+
+
+
+### Run Gaussian mixture clustering
+
+```{r}
+
+# Mclust parameters
+G = 9
+# possible models. mclust.options("emModelNames")
+model='VVI' # diagonal, varying volume and shape
+prior=priorControl()
+# sample this amount for testing. Set less than 1 to not sample
+nsamp = 5000
+nit = 1
+
+mcl = list()
+for(slideID in slideIDs){
+  slidedata = atl[ atl$SlideID==slideID ,cellvars]
+  if(nsamp>0){
+    slidedata = slidedata[ sample(nrow(slidedata), nsamp),]
+  }
+  mcl[[slideID]] = Mclust(slidedata, G=G, prior=prior, modelNames = model)
+  # delete to save memory
+  mcl[[slideID]]$data = NULL
+  #mcl[[slideID]]$z = NULL
+}
+
+# prior only works with a single mean vector I think
+#prior = priorControl(mean=l2$parameters$mean, modelname=model)
+# EB shrinkage
+mclshrink = EBupdate(mcl, G=G)
+l2 = mclshrink[[2]]
+mclshrink = mclshrink[[1]]
+
+# map back to group level space so that labels correspond across slides
+
+```
+
